@@ -7,9 +7,11 @@ import dev.brahmkshatriya.echo.common.clients.LoginClient
 import dev.brahmkshatriya.echo.common.clients.RadioClient
 import dev.brahmkshatriya.echo.common.clients.SearchFeedClient
 import dev.brahmkshatriya.echo.common.clients.TrackClient
+import dev.brahmkshatriya.echo.common.models.Album
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.loadAll
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.pagedDataOfFirst
 import dev.brahmkshatriya.echo.common.models.Shelf
+import dev.brahmkshatriya.echo.common.models.Streamable
 import dev.brahmkshatriya.echo.common.models.Track
 import dev.brahmkshatriya.echo.common.models.User
 import kotlinx.coroutines.CoroutineScope
@@ -65,16 +67,19 @@ class ExtensionUnitTest {
         if (extension !is SearchFeedClient) error("SearchFeedClient is not implemented")
         val query = q ?: searchQuery
         println("Searching : $query")
-        val track = extension.loadSearchFeed(searchQuery).pagedDataOfFirst().loadAll()
+        val media = extension.loadSearchFeed(query).pagedDataOfFirst().loadAll()
             .firstNotNullOfOrNull {
                 when (it) {
-                    is Shelf.Item -> it.media as? Track
+                    is Shelf.Item -> it.media
                     is Shelf.Lists.Tracks -> it.list.firstOrNull()
-                    is Shelf.Lists.Items -> it.list.firstOrNull() as? Track
+                    is Shelf.Lists.Items -> it.list.firstOrNull()
                     else -> null
                 }
             }
-        return track ?: error("Track not found, try a different search query")
+        val album = media as? Album ?: (media as? Track)?.album ?: error("Album not found for search query")
+        if (extension !is AlbumClient) error("AlbumClient is not implemented")
+        val tracks = extension.loadTracks(album)?.loadAll() ?: error("No tracks for album")
+        return tracks.firstOrNull() ?: error("No track found in album")
     }
 
     @Test
@@ -93,7 +98,7 @@ class ExtensionUnitTest {
         val search = searchTrack()
         measureTimeMillis {
             val track = extension.loadTrack(search, false)
-            val streamable = track.servers.firstOrNull() ?: error("Track does not streamable")
+            val streamable = track.streamables.firstOrNull { it.type == Streamable.MediaType.Server } ?: error("Track does not have streamable")
             val stream = extension.loadStreamableMedia(streamable, false)
             println(stream)
         }.also { println("time : $it") }
