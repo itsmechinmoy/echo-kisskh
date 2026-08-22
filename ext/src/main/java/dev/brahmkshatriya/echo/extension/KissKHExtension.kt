@@ -3,6 +3,7 @@ package dev.brahmkshatriya.echo.extension
 import dev.brahmkshatriya.echo.common.clients.AlbumClient
 import dev.brahmkshatriya.echo.common.clients.ExtensionClient
 import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
+import dev.brahmkshatriya.echo.common.clients.LyricsClient
 import dev.brahmkshatriya.echo.common.clients.QuickSearchClient
 import dev.brahmkshatriya.echo.common.clients.SearchFeedClient
 import dev.brahmkshatriya.echo.common.clients.ShareClient
@@ -15,6 +16,7 @@ import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeedData
 import dev.brahmkshatriya.echo.common.models.ImageHolder.Companion.toImageHolder
+import dev.brahmkshatriya.echo.common.models.Lyrics
 import dev.brahmkshatriya.echo.common.models.NetworkRequest.Companion.toGetRequest
 import dev.brahmkshatriya.echo.common.models.QuickSearchItem
 import dev.brahmkshatriya.echo.common.models.Shelf
@@ -40,6 +42,7 @@ class KissKHExtension :
     QuickSearchClient,
     AlbumClient,
     TrackClient,
+    LyricsClient,
     ShareClient {
 
     private val json = Json {
@@ -268,7 +271,7 @@ class KissKHExtension :
                 )
             )
 
-            // Subtitles
+            // Subtitles for Video Player
             try {
                 val kkey = requestSubKey(episodeId)
                 val subData = httpGet("$baseUrl/api/Sub/$episodeId?kkey=$kkey")
@@ -361,6 +364,99 @@ class KissKHExtension :
 
     override suspend fun loadFeed(track: Track): Feed<Shelf>? = null
 
+    // --- Lyrics Client (Softsubs in Lyrics Tab) ---
+
+    override suspend fun searchTrackLyrics(clientId: String, track: Track): Feed<Lyrics> {
+        return withContext(Dispatchers.IO) {
+            val episodeId = track.extras["episodeId"] ?: track.id.substringAfter("_")
+            val list = try {
+                val kkey = requestSubKey(episodeId)
+                val subData = httpGet("$baseUrl/api/Sub/$episodeId?kkey=$kkey")
+                val subList = json.decodeFromString<List<SubtitleItemDto>>(subData)
+                subList.mapIndexedNotNull { idx, sub ->
+                    val src = sub.src ?: return@mapIndexedNotNull null
+                    val label = sub.label ?: "Subtitle $idx"
+                    Lyrics(
+                        id = "lyrics_${episodeId}_$idx",
+                        title = label,
+                        subtitle = sub.land,
+                        lyrics = null,
+                        extras = mapOf(
+                            "subUrl" to src,
+                            "label" to label,
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                emptyList()
+            }
+            list.toFeed()
+        }
+    }
+
+    override suspend fun loadLyrics(lyrics: Lyrics): Lyrics {
+        return withContext(Dispatchers.IO) {
+            val subUrl = lyrics.extras["subUrl"] ?: lyrics.id
+            val content = if (subUrl.contains(".txt", ignoreCase = true)) {
+                subDecryptor.decryptToString(subUrl)
+            } else {
+                val request = Request.Builder()
+                    .url(subUrl)
+                    .headers(getHeaders())
+                    .get()
+                    .build()
+                client.newCall(request).execute().use { res ->
+                    res.body?.string() ?: ""
+                }
+            }
+
+            val items = parseSubtitleToTimedLyrics(content)
+            lyrics.copy(lyrics = Lyrics.Lyric.Timed(items, fillTimeGaps = true))
+        }
+    }
+
+    private fun parseSubtitleToTimedLyrics(content: String): List<Lyrics.Item> {
+        val items = mutableListOf<Lyrics.Item>()
+        val lines = content.lines()
+        var i = 0
+        while (i < lines.size) {
+            val line = lines[i].trim()
+            val match = TIMESTAMP_REGEX.find(line)
+            if (match != null) {
+                val startHours = match.groupValues[1].toLongOrNull() ?: 0L
+                val startMinutes = match.groupValues[2].toLongOrNull() ?: 0L
+                val startSeconds = match.groupValues[3].toLongOrNull() ?: 0L
+                val startMillis = match.groupValues[4].padEnd(3, '0').take(3).toLongOrNull() ?: 0L
+                val startTime = ((startHours * 3600 + startMinutes * 60 + startSeconds) * 1000) + startMillis
+
+                val endHours = match.groupValues[5].toLongOrNull() ?: 0L
+                val endMinutes = match.groupValues[6].toLongOrNull() ?: 0L
+                val endSeconds = match.groupValues[7].toLongOrNull() ?: 0L
+                val endMillis = match.groupValues[8].padEnd(3, '0').take(3).toLongOrNull() ?: 0L
+                val endTime = ((endHours * 3600 + endMinutes * 60 + endSeconds) * 1000) + endMillis
+
+                val textBuilder = StringBuilder()
+                i++
+                while (i < lines.size && lines[i].isNotBlank()) {
+                    val textLine = lines[i].trim()
+                    if (!TIMESTAMP_REGEX.matches(textLine) && !textLine.matches(Regex("""^\d+$"""))) {
+                        if (textBuilder.isNotEmpty()) textBuilder.append("\n")
+                        textBuilder.append(textLine.replace(Regex("<[^>]*>"), ""))
+                    }
+                    i++
+                }
+
+                val text = textBuilder.toString().trim()
+                if (text.isNotBlank()) {
+                    items.add(Lyrics.Item(text = text, startTime = startTime, endTime = endTime))
+                }
+            } else {
+                i++
+            }
+        }
+        return items
+    }
+
     // --- Share Client ---
 
     override suspend fun onShare(item: EchoMediaItem): String {
@@ -407,13 +503,16 @@ class KissKHExtension :
 
         private const val PREF_DOMAIN_KEY = "preferred_domain"
         private val DOMAIN_ENTRIES = listOf(
-            "kisskh.ovh",
             "kisskh.do",
             "kisskh.co",
             "kisskh.id",
             "kisskh.la",
+            "kisskh.ovh",
         )
         private val DOMAIN_VALUES = DOMAIN_ENTRIES.map { "https://$it" }
         private val PREF_DOMAIN_DEFAULT = DOMAIN_VALUES[0]
+
+        private val TIMESTAMP_REGEX =
+            Regex("""(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{2,3})\s*-->\s*(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{2,3})""")
     }
 }
