@@ -26,10 +26,9 @@ import org.junit.Test
 import kotlin.system.measureTimeMillis
 
 @OptIn(DelicateCoroutinesApi::class)
-@ExperimentalCoroutinesApi
 class ExtensionUnitTest {
-    private val extension: ExtensionClient = TestExtension()
-    private val searchQuery = "Skrillex"
+    private val extension: ExtensionClient = KissKHExtension()
+    private val searchQuery = "Solo Leveling"
     private val user = User("", "Test User")
 
     @Test
