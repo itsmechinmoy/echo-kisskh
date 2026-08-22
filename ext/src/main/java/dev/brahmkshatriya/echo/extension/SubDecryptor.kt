@@ -14,7 +14,7 @@ class SubDecryptor(
     private val client: OkHttpClient,
     private val baseurl: String,
 ) {
-    suspend fun getSubtitles(subUrl: String): String {
+    fun decryptToString(subUrl: String): String {
         val subHeaders = Headers.Builder()
             .add("Accept", "application/json, text/plain, */*")
             .add("Origin", baseurl)
@@ -36,13 +36,17 @@ class SubDecryptor(
             .filter { it.isNotBlank() }
             .map { it.trim() }
 
-        val decrypted = chunks.mapIndexed { index, chunk ->
+        return chunks.mapIndexed { index, chunk ->
             val parts = chunk.split("\n")
             val text = parts.slice(1 until parts.size)
             val d = text.joinToString("\n") { runCatching { decrypt(it) }.getOrDefault("") }
 
             listOf((index + 1).toString(), parts.first(), d).joinToString("\n")
         }.joinToString("\n\n")
+    }
+
+    suspend fun getSubtitles(subUrl: String): String {
+        val decrypted = decryptToString(subUrl)
 
         val file = File.createTempFile("kisskh_subs_", ".srt").apply {
             deleteOnExit()
