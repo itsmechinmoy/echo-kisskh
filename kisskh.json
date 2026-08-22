@@ -1,0 +1,11 @@
+[
+  {
+    "id": "kisskh",
+    "type": "music",
+    "name": "KissKH",
+    "subtitle": "KissKH Extension for Echo",
+    "iconUrl": "https://kisskh.ovh/favicon.ico",
+    "url": "https://kisskh.ovh/",
+    "updateUrl": "https://api.github.com/repos/itsmechinmoy/echo-kisskh/releases"
+  }
+]
