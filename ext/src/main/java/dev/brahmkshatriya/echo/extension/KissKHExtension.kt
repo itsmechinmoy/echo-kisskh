@@ -411,7 +411,7 @@ class KissKHExtension :
             }
 
             val items = parseSubtitleToTimedLyrics(content)
-            lyrics.copy(lyrics = Lyrics.Lyric.Timed(items, fillTimeGaps = true))
+            lyrics.copy(lyrics = Lyrics.Timed(items, fillTimeGaps = true))
         }
     }
 
