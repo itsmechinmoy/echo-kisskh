@@ -250,7 +250,110 @@ class KissKHExtension :
         }
     }
 
-    override suspend fun loadFeed(album: Album): Feed<Shelf>? = null
+    override suspend fun loadFeed(album: Album): Feed<Shelf>? {
+        return withContext(Dispatchers.IO) {
+            val currentId = album.extras["dramaId"]
+                ?: album.id.substringAfter("id=").substringBefore("&")
+            val shelves = mutableListOf<Shelf>()
+
+            // 1. Seasons & Franchise (Search using cleaned base title)
+            val baseTitle = extractBaseTitle(album.title)
+            if (baseTitle.isNotBlank()) {
+                try {
+                    val encoded = URLEncoder.encode(baseTitle, "UTF-8")
+                    val searchJson = httpGet("$baseUrl/api/DramaList/Search?q=$encoded&type=0")
+                    val items = json.decodeFromString<List<DramaItemDto>>(searchJson)
+
+                    val seasonAlbums = items
+                        .filter { it.id?.toString() != currentId }
+                        .mapNotNull { it.toAlbum() }
+                        .map { alb ->
+                            val rel = detectRelationFromTitle(alb.title)
+                            alb.copy(subtitle = rel)
+                        }
+
+                    if (seasonAlbums.isNotEmpty()) {
+                        shelves.add(
+                            Shelf.Lists.Items(
+                                id = "seasons",
+                                title = "Seasons & Franchise",
+                                list = seasonAlbums
+                            )
+                        )
+                    }
+                } catch (_: Exception) {
+                }
+            }
+
+            // 2. Popular & Recommended Dramas
+            try {
+                val popularJson = httpGet("$baseUrl/api/DramaList/List?page=1&type=0&sub=0&country=0&status=0&order=1&pageSize=20")
+                val popularResponse = json.decodeFromString<DramaListResponseDto>(popularJson)
+                val popularAlbums = popularResponse.data
+                    ?.filter { it.id?.toString() != currentId }
+                    ?.mapNotNull { it.toAlbum() }
+                    ?: emptyList()
+
+                if (popularAlbums.isNotEmpty()) {
+                    shelves.add(
+                        Shelf.Lists.Items(
+                            id = "popular",
+                            title = "Popular Dramas & Anime",
+                            list = popularAlbums
+                        )
+                    )
+                }
+            } catch (_: Exception) {
+            }
+
+            if (shelves.isEmpty()) null else shelves.toFeed()
+        }
+    }
+
+    private fun DramaItemDto.toAlbum(): Album? {
+        val id = this.id?.toString() ?: return null
+        val title = this.title ?: return null
+        return Album(
+            id = id,
+            title = title,
+            type = Album.Type.Show,
+            cover = this.thumbnail?.toImageHolder(),
+            extras = mapOf("dramaId" to id)
+        )
+    }
+
+    private fun extractBaseTitle(title: String): String {
+        val parts = title.split(" - ")
+        val mainPart = if (parts.size > 1) parts.last() else parts.first()
+
+        return mainPart
+            .replace(Regex("""(?i)\s*(?:Season|\bS\b|\bSS\b|\bPart|\bCour|\bChapter)\s*\d+.*"""), "")
+            .replace(Regex("""(?i)\s*\d+(?:st|nd|rd|th)\s*Season.*"""), "")
+            .replace(Regex("""(?i)\s*:\s*(?:Workshop Battle|Final Season|Entertainment District|Swordsmith Village|Hashira Training|Shibuya Incident|Invasion).*"""), "")
+            .replace(Regex("""\s*\(\d{4}\).*"""), "")
+            .replace(Regex("""\s*\([^\)]*\)"""), "")
+            .trim()
+    }
+
+    private fun detectRelationFromTitle(title: String): String {
+        return when {
+            Regex("""(?i)\b(?:Season\s*1|1st\s*Season)\b""").containsMatchIn(title) -> "Season 1"
+            Regex("""(?i)\b(?:Season\s*2|2nd\s*Season)\b""").containsMatchIn(title) -> "Season 2"
+            Regex("""(?i)\b(?:Season\s*3|3rd\s*Season)\b""").containsMatchIn(title) -> "Season 3"
+            Regex("""(?i)\b(?:Season\s*4|4th\s*Season)\b""").containsMatchIn(title) -> "Season 4"
+            Regex("""(?i)\b(?:Season\s*5|5th\s*Season)\b""").containsMatchIn(title) -> "Season 5"
+            Regex("""(?i)\b(?:Season\s*6|6th\s*Season)\b""").containsMatchIn(title) -> "Season 6"
+            Regex("""(?i)\b(?:Final\s*Season|Part\s*2|Part\s*3|Cour\s*2)\b""").containsMatchIn(title) -> {
+                Regex("""(?i)\b(Final\s*Season|Part\s*\d+|Cour\s*\d+)\b""").find(title)?.value?.trim() ?: "Sequel"
+            }
+            Regex("""(?i)\b(?:Movie|The\s*Movie|Film)\b""").containsMatchIn(title) -> "Movie"
+            Regex("""(?i)\b(?:OVA|OAD|Special|Side\s*Story)\b""").containsMatchIn(title) -> "OVA / Special"
+            Regex("""(?i)\b(?:Prequel|Prolog)\b""").containsMatchIn(title) -> "Prequel"
+            Regex("""(?i)\b(?:Sequel)\b""").containsMatchIn(title) -> "Sequel"
+            Regex("""(?i)\b(?:Spin-off|Spinoff)\b""").containsMatchIn(title) -> "Spin-off"
+            else -> "Franchise"
+        }
+    }
 
     // --- Track Client (Stream & Subtitle Extraction) ---
 
