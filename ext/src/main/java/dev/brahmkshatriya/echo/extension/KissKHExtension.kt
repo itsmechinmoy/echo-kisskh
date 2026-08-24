@@ -15,6 +15,7 @@ import dev.brahmkshatriya.echo.common.models.EchoMediaItem
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeedData
+import dev.brahmkshatriya.echo.common.models.ImageHolder
 import dev.brahmkshatriya.echo.common.models.ImageHolder.Companion.toImageHolder
 import dev.brahmkshatriya.echo.common.models.Lyrics
 import dev.brahmkshatriya.echo.common.models.NetworkRequest.Companion.toGetRequest
@@ -122,7 +123,7 @@ class KissKHExtension :
                 val items = response.data?.mapNotNull { item ->
                     val id = item.id?.toString() ?: return@mapNotNull null
                     val title = item.title ?: return@mapNotNull null
-                    val cover = item.thumbnail?.toImageHolder()
+                    val cover = item.thumbnail?.toProxiedImageHolder()
                     Album(
                         id = id,
                         title = title,
@@ -151,7 +152,7 @@ class KissKHExtension :
             val items = json.decodeFromString<List<DramaItemDto>>(body).mapNotNull { item ->
                 val id = item.id?.toString() ?: return@mapNotNull null
                 val title = item.title ?: return@mapNotNull null
-                val cover = item.thumbnail?.toImageHolder()
+                val cover = item.thumbnail?.toProxiedImageHolder()
                 Album(
                     id = id,
                     title = title,
@@ -173,7 +174,7 @@ class KissKHExtension :
             json.decodeFromString<List<DramaItemDto>>(body).take(8).mapNotNull { item ->
                 val id = item.id?.toString() ?: return@mapNotNull null
                 val title = item.title ?: return@mapNotNull null
-                val cover = item.thumbnail?.toImageHolder()
+                val cover = item.thumbnail?.toProxiedImageHolder()
                 QuickSearchItem.Media(
                     Album(
                         id = id,
@@ -209,7 +210,7 @@ class KissKHExtension :
             album.copy(
                 title = drama.title ?: album.title,
                 description = desc,
-                cover = drama.thumbnail?.toImageHolder() ?: album.cover,
+                cover = drama.thumbnail?.toProxiedImageHolder() ?: album.cover,
             )
         }
     }
@@ -237,7 +238,7 @@ class KissKHExtension :
                     title = name,
                     type = Track.Type.Video,
                     album = album,
-                    cover = drama.thumbnail?.toImageHolder() ?: album.cover,
+                    cover = drama.thumbnail?.toProxiedImageHolder() ?: album.cover,
                     artists = emptyList(),
                     extras = mapOf(
                         "dramaId" to dramaId,
@@ -317,9 +318,22 @@ class KissKHExtension :
             id = id,
             title = title,
             type = Album.Type.Show,
-            cover = this.thumbnail?.toImageHolder(),
+            cover = this.thumbnail?.toProxiedImageHolder(),
             extras = mapOf("dramaId" to id)
         )
+    }
+
+    private fun String?.toWsrvUrl(): String? {
+        if (this.isNullOrBlank()) return null
+        if (this.startsWith("https://wsrv.nl/?url=") || this.startsWith("http://wsrv.nl/?url=")) return this
+        val fullUrl = if (this.startsWith("//")) "https:$this"
+        else if (this.startsWith("/")) "$baseUrl$this"
+        else this
+        return "https://wsrv.nl/?url=$fullUrl"
+    }
+
+    private fun String?.toProxiedImageHolder(): ImageHolder? {
+        return this.toWsrvUrl()?.toImageHolder()
     }
 
     private fun extractBaseTitle(title: String): String {
