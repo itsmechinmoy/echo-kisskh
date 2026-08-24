@@ -224,7 +224,9 @@ class KissKHExtension :
             val type = drama.type
             val episodesCount = drama.episodesCount ?: 1
 
-            val tracks = drama.episodes?.mapNotNull { ep ->
+            val tracks = drama.episodes
+                ?.sortedBy { it.number ?: 0.0 }
+                ?.mapNotNull { ep ->
                 val episodeId = ep.id?.toString() ?: return@mapNotNull null
                 val number = ep.number?.toString()?.replace(".0", "") ?: "1"
                 val name = when {
