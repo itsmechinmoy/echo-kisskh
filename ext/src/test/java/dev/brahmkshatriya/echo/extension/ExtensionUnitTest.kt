@@ -4,6 +4,7 @@ import dev.brahmkshatriya.echo.common.clients.AlbumClient
 import dev.brahmkshatriya.echo.common.clients.ExtensionClient
 import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
 import dev.brahmkshatriya.echo.common.clients.LoginClient
+import dev.brahmkshatriya.echo.common.clients.LyricsClient
 import dev.brahmkshatriya.echo.common.clients.RadioClient
 import dev.brahmkshatriya.echo.common.clients.SearchFeedClient
 import dev.brahmkshatriya.echo.common.clients.TrackClient
@@ -105,14 +106,17 @@ class ExtensionUnitTest {
     }
 
     @Test
-    fun testTrackRadio() = testIn("Testing Track Radio") {
-        if (extension !is TrackClient) error("TrackClient is not implemented")
-        if (extension !is RadioClient) error("RadioClient is not implemented")
-        val track = extension.loadTrack(searchTrack(), false)
-        val radio = extension.radio(track, null)
-        val radioTracks = extension.loadTracks(radio).loadAll()
-        radioTracks.forEach {
-            println(it)
+    fun testLyrics() = testIn("Testing Subtitles / Lyrics") {
+        if (extension !is LyricsClient) error("LyricsClient is not implemented")
+        val search = searchTrack()
+        val track = (extension as TrackClient).loadTrack(search, false)
+        val lyricsFeed = extension.searchTrackLyrics("", track)
+        val lyricsList = lyricsFeed.loadAll()
+        println("Found lyrics: ${lyricsList.size}")
+        val firstLyrics = lyricsList.firstOrNull()
+        if (firstLyrics != null) {
+            val loaded = extension.loadLyrics(firstLyrics)
+            println("Loaded lyrics: ${loaded.title}")
         }
     }
 
