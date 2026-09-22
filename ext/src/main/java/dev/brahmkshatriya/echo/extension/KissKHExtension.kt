@@ -82,10 +82,17 @@ class KissKHExtension :
             .build()
     }
 
-    private fun httpGet(url: String): String {
+    private fun httpGet(url: String, sendBaseHeaders: Boolean = true): String {
+        val headersBuilder = Headers.Builder()
+            .add("User-Agent", USER_AGENT)
+        if (sendBaseHeaders) {
+            headersBuilder
+                .add("Referer", "$baseUrl/")
+                .add("Origin", baseUrl)
+        }
         val request = Request.Builder()
             .url(url)
-            .headers(getHeaders())
+            .headers(headersBuilder.build())
             .get()
             .build()
         client.newCall(request).execute().use { response ->
@@ -96,13 +103,13 @@ class KissKHExtension :
 
     private fun requestVideoKey(id: String): String {
         val url = "$KISSKH_API$id&version=2.8.10"
-        val body = httpGet(url)
+        val body = httpGet(url, sendBaseHeaders = false)
         return json.decodeFromString<KeyResponseDto>(body).key ?: throw Exception("Failed to get video key")
     }
 
     private fun requestSubKey(id: String): String {
         val url = "$KISSKH_SUB_API$id&version=2.8.10"
-        val body = httpGet(url)
+        val body = httpGet(url, sendBaseHeaders = false)
         return json.decodeFromString<KeyResponseDto>(body).key ?: throw Exception("Failed to get sub key")
     }
 
@@ -432,8 +439,10 @@ class KissKHExtension :
                     val url = "$baseUrl/api/DramaList/Episode/$episodeId.png?err=false&ts=&time=&kkey=$kkey"
                     val body = httpGet(url)
                     val videoDto = json.decodeFromString<VideoResponseDto>(body)
-                    val videoUrl = videoDto.Video
+                    val rawVideoUrl = videoDto.Video
                         ?: throw Exception("No stream available for episode $episodeId")
+                    val videoUrl = fixUrl(rawVideoUrl)
+                        ?: throw Exception("Invalid stream URL for episode $episodeId")
 
                     val isHls = videoUrl.contains(".m3u8", ignoreCase = true)
                     val source = Streamable.Source.Http(
@@ -576,6 +585,18 @@ class KissKHExtension :
         return items
     }
 
+    private fun fixUrl(url: String): String? {
+        return when {
+            url.isBlank() -> null
+            url.startsWith("http") -> url
+            url.startsWith("//") -> "https:$url"
+            url.contains("https://") -> url.substring(url.indexOf("https://"))
+            url.contains("http://") -> url.substring(url.indexOf("http://"))
+            url.startsWith("/") -> "$baseUrl$url"
+            else -> url
+        }
+    }
+
     // --- Share Client ---
 
     override suspend fun onShare(item: EchoMediaItem): String {
@@ -623,10 +644,10 @@ class KissKHExtension :
         private const val PREF_DOMAIN_KEY = "preferred_domain"
         private val DOMAIN_ENTRIES = listOf(
             "kisskh.do",
+            "kisskh.ovh",
             "kisskh.co",
             "kisskh.id",
             "kisskh.la",
-            "kisskh.ovh",
         )
         private val DOMAIN_VALUES = DOMAIN_ENTRIES.map { "https://$it" }
         private val PREF_DOMAIN_DEFAULT = DOMAIN_VALUES[0]
