@@ -213,8 +213,12 @@ class KissKHExtension :
                 } ?: emptyList()
 
                 val totalCount = response.totalCount ?: 0
-                val totalPages = (totalCount + PAGE_SIZE - 1) / PAGE_SIZE
-                val nextPage = if (page < totalPages) (page + 1).toString() else null
+                val hasNextPage = if (totalCount > 0) {
+                    page < (totalCount + PAGE_SIZE - 1) / PAGE_SIZE
+                } else {
+                    items.size >= PAGE_SIZE
+                }
+                val nextPage = if (hasNextPage) (page + 1).toString() else null
 
                 Page(items, nextPage)
             }
@@ -225,6 +229,37 @@ class KissKHExtension :
     // --- Search Feed ---
 
     override suspend fun loadSearchFeed(query: String): Feed<Shelf> {
+        if (query.isBlank()) {
+            val pagedData = PagedData.Continuous<Shelf> { continuation ->
+                val page = continuation?.toIntOrNull() ?: 1
+                val url = "$baseUrl/api/DramaList/List?page=$page&type=0&sub=0&country=0&status=0&order=1&pageSize=$PAGE_SIZE"
+                val body = httpGet(url)
+                val response = json.decodeFromString<DramaPageDto>(body)
+                val items = response.data?.mapNotNull { item ->
+                    val id = item.id?.toString() ?: return@mapNotNull null
+                    val title = item.title ?: return@mapNotNull null
+                    val cover = item.thumbnail?.toProxiedImageHolder()
+                    Album(
+                        id = id,
+                        title = title,
+                        cover = cover,
+                        artists = emptyList(),
+                    ).toShelf()
+                } ?: emptyList()
+
+                val totalCount = response.totalCount ?: 0
+                val hasNextPage = if (totalCount > 0) {
+                    page < (totalCount + PAGE_SIZE - 1) / PAGE_SIZE
+                } else {
+                    items.size >= PAGE_SIZE
+                }
+                val nextPage = if (hasNextPage) (page + 1).toString() else null
+
+                Page(items, nextPage)
+            }
+            return pagedData.toFeed()
+        }
+
         val pagedData = PagedData.Continuous<Shelf> {
             val encoded = URLEncoder.encode(query, "UTF-8")
             val url = "$baseUrl/api/DramaList/Search?q=$encoded&type=0"
