@@ -28,7 +28,7 @@ import org.junit.Before
 import org.junit.Test
 import kotlin.system.measureTimeMillis
 
-@OptIn(DelicateCoroutinesApi::class)
+@OptIn(DelicateCoroutinesApi::class, ExperimentalCoroutinesApi::class)
 class ExtensionUnitTest {
     private val extension: ExtensionClient = KissKHExtension()
     private val searchQuery = "Solo Leveling"
