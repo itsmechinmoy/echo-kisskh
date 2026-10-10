@@ -1,114 +1,828 @@
 package dev.brahmkshatriya.echo.extension
 
+import dev.brahmkshatriya.echo.common.clients.AlbumClient
+import dev.brahmkshatriya.echo.common.clients.ExtensionClient
+import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
+import dev.brahmkshatriya.echo.common.clients.LyricsClient
+import dev.brahmkshatriya.echo.common.clients.QuickSearchClient
+import dev.brahmkshatriya.echo.common.clients.SearchFeedClient
+import dev.brahmkshatriya.echo.common.clients.ShareClient
+import dev.brahmkshatriya.echo.common.clients.TrackClient
+import dev.brahmkshatriya.echo.common.helpers.Page
+import dev.brahmkshatriya.echo.common.helpers.PagedData
+import dev.brahmkshatriya.echo.common.models.Album
+import dev.brahmkshatriya.echo.common.models.EchoMediaItem
+import dev.brahmkshatriya.echo.common.models.Feed
+import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
+import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeedData
+import dev.brahmkshatriya.echo.common.models.ImageHolder
+import dev.brahmkshatriya.echo.common.models.ImageHolder.Companion.toImageHolder
+import dev.brahmkshatriya.echo.common.models.Lyrics
+import dev.brahmkshatriya.echo.common.models.NetworkRequest.Companion.toGetRequest
+import dev.brahmkshatriya.echo.common.models.QuickSearchItem
+import dev.brahmkshatriya.echo.common.models.Shelf
+import dev.brahmkshatriya.echo.common.models.Streamable
+import dev.brahmkshatriya.echo.common.models.Tab
+import dev.brahmkshatriya.echo.common.models.Track
+import dev.brahmkshatriya.echo.common.settings.Setting
+import dev.brahmkshatriya.echo.common.settings.SettingList
+import dev.brahmkshatriya.echo.common.settings.SettingSwitch
+import dev.brahmkshatriya.echo.common.settings.Settings
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
 import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.io.File
-import java.io.IOException
-import java.util.Base64
-import javax.crypto.Cipher
-import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.SecretKeySpec
+import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import kotlin.coroutines.cancellation.CancellationException
 
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+class KissKHExtension :
+    ExtensionClient,
+    HomeFeedClient,
+    SearchFeedClient,
+    QuickSearchClient,
+    AlbumClient,
+    TrackClient,
+    LyricsClient,
+    ShareClient {
 
-class SubDecryptor(
-    private val client: OkHttpClient,
-    private val baseUrl: String,
-) {
-    suspend fun decryptToString(subUrl: String): String = withContext(Dispatchers.IO) {
-        val subHeaders = Headers.Builder()
-            .add("Accept", "application/json, text/plain, */*")
-            .add("Origin", baseUrl)
+    private val json = Json {
+        isLenient = true
+        ignoreUnknownKeys = true
+    }
+
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .build()
+
+    private var settings: Settings? = null
+
+    private val baseUrl: String
+        get() = settings?.getString(PREF_DOMAIN_KEY) ?: PREF_DOMAIN_DEFAULT
+
+    private val hideUnaired: Boolean
+        get() = settings?.getBoolean(PREF_HIDE_UNAIRED_KEY) ?: PREF_HIDE_UNAIRED_DEFAULT
+
+    private val preferredQuality: String
+        get() = settings?.getString(PREF_QUALITY_KEY) ?: PREF_QUALITY_DEFAULT
+
+    private val subDecryptor: SubDecryptor
+        get() = SubDecryptor(client, baseUrl)
+
+    private val videoKeyCache = ConcurrentHashMap<String, String>()
+    private val subKeyCache = ConcurrentHashMap<String, String>()
+
+    private val countdownDateFormat by lazy {
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ROOT)
+    }
+
+    private val titleUriRegex by lazy { Regex("[^a-zA-Z0-9]") }
+
+    override suspend fun onExtensionSelected() {}
+
+    override fun setSettings(settings: Settings) {
+        this.settings = settings
+    }
+
+    // --- Network Helpers ---
+
+    private fun getHeaders(): Headers {
+        return Headers.Builder()
+            .add("User-Agent", USER_AGENT)
             .add("Referer", "$baseUrl/")
+            .add("Origin", baseUrl)
             .build()
+    }
 
+    private suspend fun httpGet(url: String, sendBaseHeaders: Boolean = true): String = withContext(Dispatchers.IO) {
+        val headersBuilder = Headers.Builder()
+            .add("User-Agent", USER_AGENT)
+        if (sendBaseHeaders) {
+            headersBuilder
+                .add("Referer", "$baseUrl/")
+                .add("Origin", baseUrl)
+        }
         val request = Request.Builder()
-            .url(subUrl)
-            .headers(subHeaders)
+            .url(url)
+            .headers(headersBuilder.build())
             .get()
             .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw Exception("HTTP ${response.code} for $url")
+            response.body?.string() ?: throw Exception("Empty body for $url")
+        }
+    }
 
-        val response = client.newCall(request).execute()
-        if (!response.isSuccessful) throw IOException("Failed to fetch subtitle from $subUrl (code ${response.code})")
+    private suspend fun requestVideoKey(id: String): String {
+        videoKeyCache[id]?.let { return it }
+        val url = "$KISSKH_API$id&version=2.8.10"
+        val body = httpGet(url, sendBaseHeaders = false)
+        val key = json.decodeFromString<KeyResponseDto>(body).key ?: throw Exception("Failed to get video key")
+        videoKeyCache[id] = key
+        return key
+    }
 
-        val subtitleData = response.body?.string() ?: throw IOException("Empty subtitle body")
+    private suspend fun requestSubKey(id: String): String {
+        subKeyCache[id]?.let { return it }
+        val url = "$KISSKH_SUB_API$id&version=2.8.10"
+        val body = httpGet(url, sendBaseHeaders = false)
+        val key = json.decodeFromString<KeyResponseDto>(body).key ?: throw Exception("Failed to get sub key")
+        subKeyCache[id] = key
+        return key
+    }
 
-        val chunks = subtitleData.split(CHUNK_REGEX)
-            .filter { it.isNotBlank() }
-            .map { it.trim() }
+    private suspend fun fetchEpisodeVideo(id: String): EpisodeVideoDto {
+        val kkey = requestVideoKey(id)
+        val url = "$baseUrl/api/DramaList/Episode/$id.png?err=false&ts=&time=&kkey=$kkey"
+        val body = httpGet(url)
+        return json.decodeFromString<EpisodeVideoDto>(body)
+    }
 
-        var decryptedCount = 0
-        val decrypted = chunks.mapIndexed { index, chunk ->
-            val parts = chunk.lines()
-            val text = parts.drop(1)
-            val d = text.joinToString("\n") { line ->
-                val decryptedLine = decrypt(line)
-                if (decryptedLine.isNotBlank()) decryptedCount++
-                decryptedLine
+    private fun isCountdownWidget(videoUrl: String?, type: Int?): Boolean {
+        if (type == TYPE_COUNTDOWN) return true
+        if (videoUrl.isNullOrBlank()) return false
+        return videoUrl.contains("tickcounter.com", ignoreCase = true) ||
+            videoUrl.contains("/widget/countdown/", ignoreCase = true)
+    }
+
+    private suspend fun getCountdownDetails(url: String?): String? = try {
+        val widgetUrl = fixUrl(url ?: return null) ?: return null
+        val html = httpGet(widgetUrl, sendBaseHeaders = false)
+        val match = COUNTDOWN_REGEX.find(html) ?: return null
+        val (dateStr, tzStr) = match.destructured
+        val target = synchronized(countdownDateFormat) {
+            countdownDateFormat.timeZone = TimeZone.getTimeZone(tzStr)
+            try {
+                countdownDateFormat.parse(dateStr)?.time ?: 0L
+            } catch (_: Exception) {
+                0L
+            }
+        }
+        if (target <= 0L) null
+        else {
+            val diff = target - System.currentTimeMillis()
+            if (diff <= 0) {
+                "airs soon"
+            } else {
+                val days = TimeUnit.MILLISECONDS.toDays(diff)
+                val hours = TimeUnit.MILLISECONDS.toHours(diff) % 24
+                val minutes = TimeUnit.MILLISECONDS.toMinutes(diff) % 60
+                buildString {
+                    append("airs in ")
+                    if (days > 0) append("${days}d ")
+                    if (hours > 0 || days > 0) append("${hours}h ")
+                    append("${minutes}m")
+                }.trim()
+            }
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    // --- Home Feed ---
+
+    override suspend fun loadHomeFeed(): Feed<Shelf> {
+        val tabs = mutableListOf(
+            Tab("popular", "Popular", false),
+            Tab("latest", "Latest Updates", false),
+        )
+        return Feed(tabs) { tab ->
+            val pagedData = PagedData.Continuous<Shelf> { continuation ->
+                val page = continuation?.toIntOrNull() ?: 1
+                val order = if (tab?.id == "latest") "2" else "1"
+                val url = "$baseUrl/api/DramaList/List?page=$page&type=0&sub=0&country=0&status=0&order=$order&pageSize=$PAGE_SIZE"
+                val body = httpGet(url)
+                val response = json.decodeFromString<DramaPageDto>(body)
+                val items = response.data?.mapNotNull { item ->
+                    val id = item.id?.toString() ?: return@mapNotNull null
+                    val title = item.title ?: return@mapNotNull null
+                    val cover = item.thumbnail?.toProxiedImageHolder()
+                    Album(
+                        id = id,
+                        title = title,
+                        cover = cover,
+                        artists = emptyList(),
+                    ).toShelf()
+                } ?: emptyList()
+
+                val totalCount = response.totalCount ?: 0
+                val totalPages = (totalCount + PAGE_SIZE - 1) / PAGE_SIZE
+                val nextPage = if (page < totalPages) (page + 1).toString() else null
+
+                Page(items, nextPage)
+            }
+            pagedData.toFeedData()
+        }
+    }
+
+    // --- Search Feed ---
+
+    override suspend fun loadSearchFeed(query: String): Feed<Shelf> {
+        if (query.isBlank()) {
+            val pagedData = PagedData.Continuous<Shelf> { continuation ->
+                val page = continuation?.toIntOrNull() ?: 1
+                val url = "$baseUrl/api/DramaList/List?page=$page&type=0&sub=0&country=0&status=0&order=1&pageSize=$PAGE_SIZE"
+                val body = httpGet(url)
+                val response = json.decodeFromString<DramaPageDto>(body)
+                val items = response.data?.mapNotNull { item ->
+                    val id = item.id?.toString() ?: return@mapNotNull null
+                    val title = item.title ?: return@mapNotNull null
+                    val cover = item.thumbnail?.toProxiedImageHolder()
+                    Album(
+                        id = id,
+                        title = title,
+                        cover = cover,
+                        artists = emptyList(),
+                    ).toShelf()
+                } ?: emptyList()
+
+                val totalCount = response.totalCount ?: 0
+                val totalPages = (totalCount + PAGE_SIZE - 1) / PAGE_SIZE
+                val nextPage = if (page < totalPages) (page + 1).toString() else null
+
+                Page(items, nextPage)
+            }
+            return pagedData.toFeed()
+        }
+
+        val pagedData = PagedData.Continuous<Shelf> {
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val url = "$baseUrl/api/DramaList/Search?q=$encoded&type=0"
+            val body = httpGet(url)
+            val items = json.decodeFromString<List<DramaItemDto>>(body).mapNotNull { item ->
+                val id = item.id?.toString() ?: return@mapNotNull null
+                val title = item.title ?: return@mapNotNull null
+                val cover = item.thumbnail?.toProxiedImageHolder()
+                Album(
+                    id = id,
+                    title = title,
+                    cover = cover,
+                    artists = emptyList(),
+                ).toShelf()
+            }
+            Page(items, null)
+        }
+        return pagedData.toFeed()
+    }
+
+    override suspend fun quickSearch(query: String): List<QuickSearchItem> {
+        if (query.isBlank()) return emptyList()
+        return withContext(Dispatchers.IO) {
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val url = "$baseUrl/api/DramaList/Search?q=$encoded&type=0"
+            val body = httpGet(url)
+            json.decodeFromString<List<DramaItemDto>>(body).take(8).mapNotNull { item ->
+                val id = item.id?.toString() ?: return@mapNotNull null
+                val title = item.title ?: return@mapNotNull null
+                val cover = item.thumbnail?.toProxiedImageHolder()
+                QuickSearchItem.Media(
+                    Album(
+                        id = id,
+                        title = title,
+                        cover = cover,
+                        artists = emptyList(),
+                    ),
+                    false
+                )
+            }
+        }
+    }
+
+    override suspend fun deleteQuickSearch(item: QuickSearchItem) {}
+
+    // --- Album Client (Drama Details & Episodes) ---
+
+    override suspend fun loadAlbum(album: Album): Album {
+        return withContext(Dispatchers.IO) {
+            val dramaId = album.id.substringAfter("id=").substringBefore("&")
+            val url = "$baseUrl/api/DramaList/Drama/$dramaId?isq=false"
+            val body = httpGet(url)
+            val drama = json.decodeFromString<DramaDetailDto>(body)
+
+            val desc = buildString {
+                drama.status?.let { append("Status: $it\n") }
+                drama.country?.let { append("Country: $it\n") }
+                drama.type?.let { append("Type: $it\n") }
+                drama.episodesCount?.let { append("Episodes: $it\n\n") }
+                drama.description?.let { append(it) }
             }
 
-            "${index + 1}\n${parts.first()}\n$d"
-        }.joinToString("\n\n")
-
-        if (chunks.isNotEmpty() && decryptedCount == 0) {
-            throw IOException("Failed to decrypt subtitles: no cues could be decrypted")
+            album.copy(
+                title = drama.title ?: album.title,
+                description = desc,
+                cover = drama.thumbnail?.toProxiedImageHolder() ?: album.cover,
+            )
         }
-
-        decrypted
     }
 
-    suspend fun getSubtitles(subUrl: String): String = withContext(Dispatchers.IO) {
-        val decrypted = decryptToString(subUrl)
+    override suspend fun loadTracks(album: Album): Feed<Track>? {
+        return withContext(Dispatchers.IO) {
+            val dramaId = album.id.substringAfter("id=").substringBefore("&")
+            val url = "$baseUrl/api/DramaList/Drama/$dramaId?isq=false"
+            val body = httpGet(url)
+            val drama = json.decodeFromString<DramaDetailDto>(body)
+            val type = drama.type
+            val episodesCount = drama.episodesCount ?: 1
+            val status = drama.status.orEmpty().lowercase(Locale.ROOT)
+            val isAiringOrUpcoming = "ongoing" in status || "upcoming" in status
 
-        val file = File.createTempFile("kisskh_subs_", ".srt").apply {
-            deleteOnExit()
-            writeText(decrypted)
+            val rawEpisodes = drama.episodes.orEmpty()
+            val episodes = if (hideUnaired && isAiringOrUpcoming) {
+                filterUnairedEpisodes(rawEpisodes)
+            } else {
+                rawEpisodes
+            }
+
+            val tracks = episodes
+                .sortedBy { it.number ?: 0.0 }
+                .mapNotNull { ep ->
+                    val episodeId = ep.id?.toString() ?: return@mapNotNull null
+                    val number = ep.number?.toString()?.replace(".0", "") ?: "1"
+                    val name = when {
+                        type.isNullOrBlank() -> "Video $number"
+                        (type.contains("Hollywood", ignoreCase = true) && episodesCount == 1) || type.contains("Movie", ignoreCase = true) -> "Movie"
+                        else -> "Episode $number"
+                    }
+
+                    Track(
+                        id = "${dramaId}_$episodeId",
+                        title = name,
+                        type = Track.Type.Video,
+                        album = album,
+                        cover = drama.thumbnail?.toProxiedImageHolder() ?: album.cover,
+                        artists = emptyList(),
+                        extras = mapOf(
+                            "dramaId" to dramaId,
+                            "episodeId" to episodeId,
+                        )
+                    )
+                }
+
+            tracks.toFeed()
         }
-
-        file.toURI().toString()
     }
 
-    private fun decrypt(encryptedB64: String): String {
-        if (encryptedB64.isBlank()) return ""
-        for (pair in KEY_IV_PAIRS) {
+    private suspend fun filterUnairedEpisodes(episodes: List<EpisodeDto>): List<EpisodeDto> {
+        var firstAiredIndex = 0
+        for ((index, ep) in episodes.withIndex()) {
+            val epId = ep.id?.toString() ?: break
+            val isUnaired = try {
+                isEpisodeUnaired(epId)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                break
+            }
+            if (isUnaired) {
+                firstAiredIndex = index + 1
+            } else {
+                break
+            }
+        }
+        return episodes.drop(firstAiredIndex)
+    }
+
+    private suspend fun isEpisodeUnaired(epId: String): Boolean {
+        val videoDto = fetchEpisodeVideo(epId)
+        return isCountdownWidget(videoDto.video, videoDto.type)
+    }
+
+    override suspend fun loadFeed(album: Album): Feed<Shelf>? {
+        return withContext(Dispatchers.IO) {
+            val currentId = album.extras["dramaId"]
+                ?: album.id.substringAfter("id=").substringBefore("&")
+            val shelves = mutableListOf<Shelf>()
+
+            // 1. Seasons & Franchise (Search using cleaned base title)
+            val baseTitle = extractBaseTitle(album.title)
+            if (baseTitle.isNotBlank()) {
+                try {
+                    val encoded = URLEncoder.encode(baseTitle, "UTF-8")
+                    val searchJson = httpGet("$baseUrl/api/DramaList/Search?q=$encoded&type=0")
+                    val items = json.decodeFromString<List<DramaItemDto>>(searchJson)
+
+                    val seasonAlbums = items
+                        .filter { it.id?.toString() != currentId }
+                        .mapNotNull { it.toAlbum() }
+                        .map { alb ->
+                            val rel = detectRelationFromTitle(alb.title)
+                            alb.copy(subtitle = rel)
+                        }
+
+                    if (seasonAlbums.isNotEmpty()) {
+                        shelves.add(
+                            Shelf.Lists.Items(
+                                id = "seasons",
+                                title = "Seasons & Franchise",
+                                list = seasonAlbums
+                            )
+                        )
+                    }
+                } catch (_: Exception) {
+                }
+            }
+
+            // 2. Popular & Recommended Dramas
             try {
-                return decryptWithKeyIv(pair.first, pair.second, encryptedB64)
+                val popularJson = httpGet("$baseUrl/api/DramaList/List?page=1&type=0&sub=0&country=0&status=0&order=1&pageSize=20")
+                val popularResponse = json.decodeFromString<DramaPageDto>(popularJson)
+                val popularAlbums = popularResponse.data
+                    ?.filter { it.id?.toString() != currentId }
+                    ?.mapNotNull { it.toAlbum() }
+                    ?: emptyList()
+
+                if (popularAlbums.isNotEmpty()) {
+                    shelves.add(
+                        Shelf.Lists.Items(
+                            id = "popular",
+                            title = "Popular Dramas & Anime",
+                            list = popularAlbums
+                        )
+                    )
+                }
             } catch (_: Exception) {
             }
+
+            if (shelves.isEmpty()) null else shelves.toFeed()
         }
-        return ""
     }
 
-    private fun decryptWithKeyIv(keyBytes: ByteArray, ivBytes: ByteArray, encryptedB64: String): String {
-        val encryptedBytes = Base64.getDecoder().decode(encryptedB64.trim())
-        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(ivBytes))
-        return String(cipher.doFinal(encryptedBytes), Charsets.UTF_8)
+    private fun DramaItemDto.toAlbum(): Album? {
+        val id = this.id?.toString() ?: return null
+        val title = this.title ?: return null
+        return Album(
+            id = id,
+            title = title,
+            type = Album.Type.Show,
+            cover = this.thumbnail?.toProxiedImageHolder(),
+            extras = mapOf("dramaId" to id)
+        )
+    }
+
+    private fun String?.toWsrvUrl(): String? {
+        if (this.isNullOrBlank()) return null
+        if (this.startsWith("https://wsrv.nl/?url=") || this.startsWith("http://wsrv.nl/?url=")) return this
+        val fullUrl = if (this.startsWith("//")) "https:$this"
+        else if (this.startsWith("/")) "$baseUrl$this"
+        else this
+        return "https://wsrv.nl/?url=$fullUrl"
+    }
+
+    private fun String?.toProxiedImageHolder(): ImageHolder? {
+        return this.toWsrvUrl()?.toImageHolder()
+    }
+
+    private fun extractBaseTitle(title: String): String {
+        val parts = title.split(" - ")
+        val mainPart = if (parts.size > 1) parts.last() else parts.first()
+
+        return mainPart
+            .replace(Regex("""(?i)\s*(?:Season|\bS\b|\bSS\b|\bPart|\bCour|\bChapter)\s*\d+.*"""), "")
+            .replace(Regex("""(?i)\s*\d+(?:st|nd|rd|th)\s*Season.*"""), "")
+            .replace(Regex("""(?i)\s*:\s*(?:Workshop Battle|Final Season|Entertainment District|Swordsmith Village|Hashira Training|Shibuya Incident|Invasion).*"""), "")
+            .replace(Regex("""\s*\(\d{4}\).*"""), "")
+            .replace(Regex("""\s*\([^\)]*\)"""), "")
+            .trim()
+    }
+
+    private fun detectRelationFromTitle(title: String): String {
+        return when {
+            Regex("""(?i)\b(?:Season\s*1|1st\s*Season)\b""").containsMatchIn(title) -> "Season 1"
+            Regex("""(?i)\b(?:Season\s*2|2nd\s*Season)\b""").containsMatchIn(title) -> "Season 2"
+            Regex("""(?i)\b(?:Season\s*3|3rd\s*Season)\b""").containsMatchIn(title) -> "Season 3"
+            Regex("""(?i)\b(?:Season\s*4|4th\s*Season)\b""").containsMatchIn(title) -> "Season 4"
+            Regex("""(?i)\b(?:Season\s*5|5th\s*Season)\b""").containsMatchIn(title) -> "Season 5"
+            Regex("""(?i)\b(?:Season\s*6|6th\s*Season)\b""").containsMatchIn(title) -> "Season 6"
+            Regex("""(?i)\b(?:Final\s*Season|Part\s*2|Part\s*3|Cour\s*2)\b""").containsMatchIn(title) -> {
+                Regex("""(?i)\b(Final\s*Season|Part\s*\d+|Cour\s*\d+)\b""").find(title)?.value?.trim() ?: "Sequel"
+            }
+            Regex("""(?i)\b(?:Movie|The\s*Movie|Film)\b""").containsMatchIn(title) -> "Movie"
+            Regex("""(?i)\b(?:OVA|OAD|Special|Side\s*Story)\b""").containsMatchIn(title) -> "OVA / Special"
+            Regex("""(?i)\b(?:Prequel|Prolog)\b""").containsMatchIn(title) -> "Prequel"
+            Regex("""(?i)\b(?:Sequel)\b""").containsMatchIn(title) -> "Sequel"
+            Regex("""(?i)\b(?:Spin-off|Spinoff)\b""").containsMatchIn(title) -> "Spin-off"
+            else -> "Franchise"
+        }
+    }
+
+    // --- Track Client (Stream & Subtitle Extraction) ---
+
+    override suspend fun loadTrack(track: Track, isDownload: Boolean): Track {
+        return withContext(Dispatchers.IO) {
+            val episodeId = track.extras["episodeId"]
+                ?: track.id.substringAfter("_")
+
+            val streamables = mutableListOf<Streamable>()
+
+            // Preferred quality integer
+            val qualityInt = preferredQuality.toIntOrNull() ?: 1080
+
+            // Default Video Server
+            streamables.add(
+                Streamable.server(
+                    id = "server_$episodeId",
+                    quality = qualityInt,
+                    title = "KissKH Server",
+                    extras = mapOf("episodeId" to episodeId)
+                )
+            )
+
+            // Subtitles for Video Player
+            try {
+                val kkey = requestSubKey(episodeId)
+                val subData = httpGet("$baseUrl/api/Sub/$episodeId?kkey=$kkey")
+                val subList = json.decodeFromString<List<SubtitleItemDto>>(subData)
+                subList.forEachIndexed { idx, sub ->
+                    val src = sub.src ?: return@forEachIndexed
+                    val label = sub.label ?: "Subtitle $idx"
+                    streamables.add(
+                        Streamable.subtitle(
+                            id = "sub_${episodeId}_$idx",
+                            title = label,
+                            extras = mapOf(
+                                "subUrl" to src,
+                                "label" to label
+                            )
+                        )
+                    )
+                }
+            } catch (_: Exception) {
+            }
+
+            track.copy(
+                streamables = streamables
+            )
+        }
+    }
+
+    override suspend fun loadStreamableMedia(
+        streamable: Streamable,
+        isDownload: Boolean
+    ): Streamable.Media {
+        return withContext(Dispatchers.IO) {
+            when (streamable.type) {
+                Streamable.MediaType.Server -> {
+                    val episodeId = streamable.extras["episodeId"]
+                        ?: streamable.id.removePrefix("server_")
+
+                    val videoDto = fetchEpisodeVideo(episodeId)
+
+                    if (isCountdownWidget(videoDto.video, videoDto.type)) {
+                        val countdown = getCountdownDetails(videoDto.video)
+                        val message = if (countdown != null) {
+                            "This episode has not aired yet ($countdown)"
+                        } else {
+                            "This episode has not aired yet (countdown timer active)"
+                        }
+                        throw Exception(message)
+                    }
+
+                    val rawVideoUrl = videoDto.video
+                        ?: throw Exception("No stream available for episode $episodeId")
+                    val videoUrl = fixUrl(rawVideoUrl)
+                        ?: throw Exception("Invalid stream URL for episode $episodeId")
+
+                    val isHls = videoUrl.contains(".m3u8", ignoreCase = true)
+                    val qualityInt = preferredQuality.toIntOrNull() ?: 1080
+
+                    val source = Streamable.Source.Http(
+                        request = videoUrl.toGetRequest(
+                            mapOf(
+                                "Referer" to "$baseUrl/",
+                                "Origin" to baseUrl,
+                                "User-Agent" to USER_AGENT
+                            )
+                        ),
+                        type = if (isHls) Streamable.SourceType.HLS else Streamable.SourceType.Progressive,
+                        isVideo = true,
+                        quality = qualityInt,
+                        title = "KissKH"
+                    )
+
+                    Streamable.Media.Server(listOf(source), merged = false)
+                }
+
+                Streamable.MediaType.Subtitle -> {
+                    val subUrl = streamable.extras["subUrl"]
+                        ?: throw Exception("Subtitle URL not found")
+
+                    if (subUrl.contains(".txt", ignoreCase = true)) {
+                        val decryptedUri = subDecryptor.getSubtitles(subUrl)
+                        Streamable.Media.Subtitle(
+                            url = decryptedUri,
+                            type = Streamable.SubtitleType.SRT
+                        )
+                    } else {
+                        val type = if (subUrl.contains(".vtt", ignoreCase = true)) {
+                            Streamable.SubtitleType.VTT
+                        } else {
+                            Streamable.SubtitleType.SRT
+                        }
+                        Streamable.Media.Subtitle(
+                            url = subUrl,
+                            type = type
+                        )
+                    }
+                }
+
+                else -> throw Exception("Unsupported streamable type: ${streamable.type}")
+            }
+        }
+    }
+
+    override suspend fun loadFeed(track: Track): Feed<Shelf>? = null
+
+    // --- Lyrics Client (Softsubs in Lyrics Tab) ---
+
+    override suspend fun searchTrackLyrics(clientId: String, track: Track): Feed<Lyrics> {
+        return withContext(Dispatchers.IO) {
+            val episodeId = track.extras["episodeId"] ?: track.id.substringAfter("_")
+            val list = try {
+                val kkey = requestSubKey(episodeId)
+                val subData = httpGet("$baseUrl/api/Sub/$episodeId?kkey=$kkey")
+                val subList = json.decodeFromString<List<SubtitleItemDto>>(subData)
+                subList.mapIndexedNotNull { idx, sub ->
+                    val src = sub.src ?: return@mapIndexedNotNull null
+                    val label = sub.label ?: "Subtitle $idx"
+                    Lyrics(
+                        id = "lyrics_${episodeId}_$idx",
+                        title = label,
+                        subtitle = sub.land,
+                        lyrics = null,
+                        extras = mapOf(
+                            "subUrl" to src,
+                            "label" to label,
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                emptyList()
+            }
+            list.toFeed()
+        }
+    }
+
+    override suspend fun loadLyrics(lyrics: Lyrics): Lyrics {
+        return withContext(Dispatchers.IO) {
+            val subUrl = lyrics.extras["subUrl"] ?: lyrics.id
+            val content = if (subUrl.contains(".txt", ignoreCase = true)) {
+                subDecryptor.decryptToString(subUrl)
+            } else {
+                httpGet(subUrl)
+            }
+
+            val items = parseSubtitleToTimedLyrics(content)
+            lyrics.copy(lyrics = Lyrics.Timed(items, fillTimeGaps = true))
+        }
+    }
+
+    private fun parseSubtitleToTimedLyrics(content: String): List<Lyrics.Item> {
+        val items = mutableListOf<Lyrics.Item>()
+        val lines = content.lines()
+        var i = 0
+        while (i < lines.size) {
+            val line = lines[i].trim()
+            val match = TIMESTAMP_REGEX.find(line)
+            if (match != null) {
+                val startHours = match.groupValues[1].toLongOrNull() ?: 0L
+                val startMinutes = match.groupValues[2].toLongOrNull() ?: 0L
+                val startSeconds = match.groupValues[3].toLongOrNull() ?: 0L
+                val startMillis = match.groupValues[4].padEnd(3, '0').take(3).toLongOrNull() ?: 0L
+                val startTime = ((startHours * 3600 + startMinutes * 60 + startSeconds) * 1000) + startMillis
+
+                val endHours = match.groupValues[5].toLongOrNull() ?: 0L
+                val endMinutes = match.groupValues[6].toLongOrNull() ?: 0L
+                val endSeconds = match.groupValues[7].toLongOrNull() ?: 0L
+                val endMillis = match.groupValues[8].padEnd(3, '0').take(3).toLongOrNull() ?: 0L
+                val endTime = ((endHours * 3600 + endMinutes * 60 + endSeconds) * 1000) + endMillis
+
+                val textBuilder = StringBuilder()
+                i++
+                while (i < lines.size && lines[i].isNotBlank()) {
+                    val textLine = lines[i].trim()
+                    if (!TIMESTAMP_REGEX.matches(textLine) && !textLine.matches(Regex("""^\d+$"""))) {
+                        if (textBuilder.isNotEmpty()) textBuilder.append("\n")
+                        textBuilder.append(textLine.replace(Regex("<[^>]*>"), ""))
+                    }
+                    i++
+                }
+
+                val text = textBuilder.toString().trim()
+                if (text.isNotBlank()) {
+                    items.add(Lyrics.Item(text = text, startTime = startTime, endTime = endTime))
+                }
+            } else {
+                i++
+            }
+        }
+        return items
+    }
+
+    private fun fixUrl(url: String): String? {
+        return when {
+            url.isBlank() -> null
+            url.startsWith("http") -> url
+            url.startsWith("//") -> "https:$url"
+            url.contains("https://") -> url.substring(url.indexOf("https://"))
+            url.contains("http://") -> url.substring(url.indexOf("http://"))
+            url.startsWith("/") -> "$baseUrl$url"
+            else -> url
+        }
+    }
+
+    // --- Share Client ---
+
+    override suspend fun onShare(item: EchoMediaItem): String {
+        return when (item) {
+            is Album -> {
+                val titleUri = item.title.replace(titleUriRegex, "-")
+                "$baseUrl/Drama/$titleUri?id=${item.id}"
+            }
+            is Track -> {
+                val album = item.album
+                val titleUri = (album?.title ?: item.title).replace(titleUriRegex, "-")
+                val dramaId = item.extras["dramaId"] ?: album?.id ?: ""
+                val epId = item.extras["episodeId"] ?: ""
+                "$baseUrl/Drama/$titleUri?id=$dramaId&ep=$epId"
+            }
+            else -> baseUrl
+        }
+    }
+
+    // --- Settings ---
+
+    override suspend fun getSettingItems(): List<Setting> {
+        return listOf(
+            SettingList(
+                key = PREF_DOMAIN_KEY,
+                title = "Preferred Domain",
+                summary = "Choose the domain to access KissKH",
+                entryTitles = DOMAIN_ENTRIES,
+                entryValues = DOMAIN_VALUES,
+                defaultEntryIndex = 0
+            ),
+            SettingList(
+                key = PREF_QUALITY_KEY,
+                title = "Preferred Quality",
+                summary = "Preferred video streaming quality",
+                entryTitles = PREF_QUALITY_ENTRIES,
+                entryValues = PREF_QUALITY_VALUES,
+                defaultEntryIndex = 0
+            ),
+            SettingSwitch(
+                key = PREF_HIDE_UNAIRED_KEY,
+                title = "Hide Unaired Episodes",
+                summary = "Hide upcoming episodes that only have a countdown timer",
+                defaultValue = PREF_HIDE_UNAIRED_DEFAULT
+            )
+        )
     }
 
     companion object {
-        private val CHUNK_REGEX = Regex("^\\d+$", RegexOption.MULTILINE)
+        private const val PAGE_SIZE = 40
+        private const val TYPE_COUNTDOWN = 2
 
-        private const val KEY = "AmSmZVcH93UQUezi"
-        private const val KEY2 = "8056483646328763"
+        private const val USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-        private val IV = intArrayOf(1382367819, 1465333859, 1902406224, 1164854838)
-        private val IV2 = intArrayOf(909653298, 909193779, 925905208, 892483379)
+        private const val KISSKH_API =
+            "https://script.google.com/macros/s/AKfycbzn8B31PuDxzaMa9_CQ0VGEDasFqfzI5bXvjaIZH4DM8DNq9q6xj1ALvZNz_JT3jF0suA/exec?id="
 
-        private fun IntArray.toByteArray(): ByteArray = ByteArray(size * 4).also { bytes ->
-            forEachIndexed { index, value ->
-                bytes[index * 4] = (value shr 24).toByte()
-                bytes[index * 4 + 1] = (value shr 16).toByte()
-                bytes[index * 4 + 2] = (value shr 8).toByte()
-                bytes[index * 4 + 3] = value.toByte()
-            }
+        private const val KISSKH_SUB_API =
+            "https://script.google.com/macros/s/AKfycbyq6hTj0ZhlinYC6xbggtgo166tp6XaDKBCGtnYk8uOfYBUFwwxBui0sGXiu_zIFmA/exec?id="
+
+        private const val PREF_DOMAIN_KEY = "preferred_domain"
+        private val DOMAIN_ENTRIES = listOf(
+            "kisskh.do",
+            "kisskh.is",
+            "kisskh.ovh",
+            "kisskh.co",
+            "kisskh.id",
+            "kisskh.la",
+        )
+        private val DOMAIN_VALUES = DOMAIN_ENTRIES.map { "https://$it" }
+        private val PREF_DOMAIN_DEFAULT = DOMAIN_VALUES[0]
+
+        private const val PREF_HIDE_UNAIRED_KEY = "pref_hide_unaired_episodes"
+        private const val PREF_HIDE_UNAIRED_DEFAULT = true
+
+        private const val PREF_QUALITY_KEY = "preferred_quality"
+        private val PREF_QUALITY_ENTRIES = listOf("1080p", "720p", "480p", "360p")
+        private val PREF_QUALITY_VALUES = listOf("1080", "720", "480", "360")
+        private const val PREF_QUALITY_DEFAULT = "1080"
+
+        private val COUNTDOWN_REGEX by lazy {
+            Regex("""window\.countdown\("([^"]+)",\s*"[^"]*",\s*\d+,\s*"[^"]*",\s*"([^"]+)"""")
         }
 
-        private val KEY_IV_PAIRS = listOf(
-            Pair(KEY.toByteArray(Charsets.UTF_8), IV.toByteArray()),
-            Pair(KEY2.toByteArray(Charsets.UTF_8), IV2.toByteArray()),
-        )
+        private val TIMESTAMP_REGEX =
+            Regex("""(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{2,3})\s*-->\s*(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{2,3})""")
     }
 }
