@@ -1,12 +1,13 @@
 package dev.brahmkshatriya.echo.extension
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 @Serializable
-data class DramaListResponseDto(
-    val data: List<DramaItemDto>? = null,
+data class DramaPageDto(
     val page: Int? = null,
     val totalCount: Int? = null,
+    val data: List<DramaItemDto>? = emptyList(),
 )
 
 @Serializable
@@ -27,7 +28,7 @@ data class DramaDetailDto(
     val type: String? = null,
     val episodesCount: Int? = null,
     val trailer: String? = null,
-    val episodes: List<EpisodeDto>? = null,
+    val episodes: List<EpisodeDto>? = emptyList(),
 )
 
 @Serializable
@@ -38,16 +39,13 @@ data class EpisodeDto(
 )
 
 @Serializable
-data class VideoResponseDto(
-    val Video: String? = null,
-    val ThirdParty: String? = null,
-)
-
-@Serializable
-data class KeyResponseDto(
-    val id: String? = null,
-    val version: String? = null,
-    val key: String? = null,
+data class EpisodeVideoDto(
+    @SerialName("Video")
+    val video: String? = null,
+    @SerialName("Type")
+    val type: Int? = null,
+    @SerialName("ThirdParty")
+    val thirdParty: String? = null,
 )
 
 @Serializable
@@ -56,4 +54,11 @@ data class SubtitleItemDto(
     val label: String? = null,
     val default: Boolean? = null,
     val land: String? = null,
+)
+
+@Serializable
+data class KeyResponseDto(
+    val id: String? = null,
+    val version: String? = null,
+    val key: String? = null,
 )
