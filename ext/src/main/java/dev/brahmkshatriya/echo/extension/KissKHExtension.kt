@@ -101,7 +101,7 @@ class KissKHExtension :
             .build()
     }
 
-    private fun httpGet(url: String, sendBaseHeaders: Boolean = true): String {
+    private suspend fun httpGet(url: String, sendBaseHeaders: Boolean = true): String = withContext(Dispatchers.IO) {
         val headersBuilder = Headers.Builder()
             .add("User-Agent", USER_AGENT)
         if (sendBaseHeaders) {
@@ -116,11 +116,11 @@ class KissKHExtension :
             .build()
         client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) throw Exception("HTTP ${response.code} for $url")
-            return response.body?.string() ?: throw Exception("Empty body for $url")
+            response.body?.string() ?: throw Exception("Empty body for $url")
         }
     }
 
-    private fun requestVideoKey(id: String): String {
+    private suspend fun requestVideoKey(id: String): String {
         videoKeyCache[id]?.let { return it }
         val url = "$KISSKH_API$id&version=2.8.10"
         val body = httpGet(url, sendBaseHeaders = false)
@@ -129,7 +129,7 @@ class KissKHExtension :
         return key
     }
 
-    private fun requestSubKey(id: String): String {
+    private suspend fun requestSubKey(id: String): String {
         subKeyCache[id]?.let { return it }
         val url = "$KISSKH_SUB_API$id&version=2.8.10"
         val body = httpGet(url, sendBaseHeaders = false)
@@ -138,7 +138,7 @@ class KissKHExtension :
         return key
     }
 
-    private fun fetchEpisodeVideo(id: String): EpisodeVideoDto {
+    private suspend fun fetchEpisodeVideo(id: String): EpisodeVideoDto {
         val kkey = requestVideoKey(id)
         val url = "$baseUrl/api/DramaList/Episode/$id.png?err=false&ts=&time=&kkey=$kkey"
         val body = httpGet(url)
@@ -152,7 +152,7 @@ class KissKHExtension :
             videoUrl.contains("/widget/countdown/", ignoreCase = true)
     }
 
-    private fun getCountdownDetails(url: String?): String? = try {
+    private suspend fun getCountdownDetails(url: String?): String? = try {
         val widgetUrl = fixUrl(url ?: return null) ?: return null
         val html = httpGet(widgetUrl, sendBaseHeaders = false)
         val match = COUNTDOWN_REGEX.find(html) ?: return null
@@ -213,12 +213,8 @@ class KissKHExtension :
                 } ?: emptyList()
 
                 val totalCount = response.totalCount ?: 0
-                val hasNextPage = if (totalCount > 0) {
-                    page < (totalCount + PAGE_SIZE - 1) / PAGE_SIZE
-                } else {
-                    items.size >= PAGE_SIZE
-                }
-                val nextPage = if (hasNextPage) (page + 1).toString() else null
+                val totalPages = (totalCount + PAGE_SIZE - 1) / PAGE_SIZE
+                val nextPage = if (page < totalPages) (page + 1).toString() else null
 
                 Page(items, nextPage)
             }
@@ -248,12 +244,8 @@ class KissKHExtension :
                 } ?: emptyList()
 
                 val totalCount = response.totalCount ?: 0
-                val hasNextPage = if (totalCount > 0) {
-                    page < (totalCount + PAGE_SIZE - 1) / PAGE_SIZE
-                } else {
-                    items.size >= PAGE_SIZE
-                }
-                val nextPage = if (hasNextPage) (page + 1).toString() else null
+                val totalPages = (totalCount + PAGE_SIZE - 1) / PAGE_SIZE
+                val nextPage = if (page < totalPages) (page + 1).toString() else null
 
                 Page(items, nextPage)
             }
@@ -377,7 +369,7 @@ class KissKHExtension :
         }
     }
 
-    private fun filterUnairedEpisodes(episodes: List<EpisodeDto>): List<EpisodeDto> {
+    private suspend fun filterUnairedEpisodes(episodes: List<EpisodeDto>): List<EpisodeDto> {
         var firstAiredIndex = 0
         for ((index, ep) in episodes.withIndex()) {
             val epId = ep.id?.toString() ?: break
@@ -397,7 +389,7 @@ class KissKHExtension :
         return episodes.drop(firstAiredIndex)
     }
 
-    private fun isEpisodeUnaired(epId: String): Boolean {
+    private suspend fun isEpisodeUnaired(epId: String): Boolean {
         val videoDto = fetchEpisodeVideo(epId)
         return isCountdownWidget(videoDto.video, videoDto.type)
     }
@@ -683,14 +675,7 @@ class KissKHExtension :
             val content = if (subUrl.contains(".txt", ignoreCase = true)) {
                 subDecryptor.decryptToString(subUrl)
             } else {
-                val request = Request.Builder()
-                    .url(subUrl)
-                    .headers(getHeaders())
-                    .get()
-                    .build()
-                client.newCall(request).execute().use { res ->
-                    res.body?.string() ?: ""
-                }
+                httpGet(subUrl)
             }
 
             val items = parseSubtitleToTimedLyrics(content)
