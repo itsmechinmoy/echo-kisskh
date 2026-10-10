@@ -10,11 +10,14 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
 class SubDecryptor(
     private val client: OkHttpClient,
     private val baseUrl: String,
 ) {
-    fun decryptToString(subUrl: String): String {
+    suspend fun decryptToString(subUrl: String): String = withContext(Dispatchers.IO) {
         val subHeaders = Headers.Builder()
             .add("Accept", "application/json, text/plain, */*")
             .add("Origin", baseUrl)
@@ -53,10 +56,10 @@ class SubDecryptor(
             throw IOException("Failed to decrypt subtitles: no cues could be decrypted")
         }
 
-        return decrypted
+        decrypted
     }
 
-    suspend fun getSubtitles(subUrl: String): String {
+    suspend fun getSubtitles(subUrl: String): String = withContext(Dispatchers.IO) {
         val decrypted = decryptToString(subUrl)
 
         val file = File.createTempFile("kisskh_subs_", ".srt").apply {
@@ -64,7 +67,7 @@ class SubDecryptor(
             writeText(decrypted)
         }
 
-        return file.toURI().toString()
+        file.toURI().toString()
     }
 
     private fun decrypt(encryptedB64: String): String {
