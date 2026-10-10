@@ -26,6 +26,7 @@ import dev.brahmkshatriya.echo.common.models.Tab
 import dev.brahmkshatriya.echo.common.models.Track
 import dev.brahmkshatriya.echo.common.settings.Setting
 import dev.brahmkshatriya.echo.common.settings.SettingList
+import dev.brahmkshatriya.echo.common.settings.SettingSwitch
 import dev.brahmkshatriya.echo.common.settings.Settings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -34,7 +35,12 @@ import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.cancellation.CancellationException
 
 class KissKHExtension :
     ExtensionClient,
@@ -61,8 +67,21 @@ class KissKHExtension :
     private val baseUrl: String
         get() = settings?.getString(PREF_DOMAIN_KEY) ?: PREF_DOMAIN_DEFAULT
 
+    private val hideUnaired: Boolean
+        get() = settings?.getBoolean(PREF_HIDE_UNAIRED_KEY) ?: PREF_HIDE_UNAIRED_DEFAULT
+
+    private val preferredQuality: String
+        get() = settings?.getString(PREF_QUALITY_KEY) ?: PREF_QUALITY_DEFAULT
+
     private val subDecryptor: SubDecryptor
         get() = SubDecryptor(client, baseUrl)
+
+    private val videoKeyCache = ConcurrentHashMap<String, String>()
+    private val subKeyCache = ConcurrentHashMap<String, String>()
+
+    private val countdownDateFormat by lazy {
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ROOT)
+    }
 
     private val titleUriRegex by lazy { Regex("[^a-zA-Z0-9]") }
 
@@ -102,15 +121,69 @@ class KissKHExtension :
     }
 
     private fun requestVideoKey(id: String): String {
+        videoKeyCache[id]?.let { return it }
         val url = "$KISSKH_API$id&version=2.8.10"
         val body = httpGet(url, sendBaseHeaders = false)
-        return json.decodeFromString<KeyResponseDto>(body).key ?: throw Exception("Failed to get video key")
+        val key = json.decodeFromString<KeyResponseDto>(body).key ?: throw Exception("Failed to get video key")
+        videoKeyCache[id] = key
+        return key
     }
 
     private fun requestSubKey(id: String): String {
+        subKeyCache[id]?.let { return it }
         val url = "$KISSKH_SUB_API$id&version=2.8.10"
         val body = httpGet(url, sendBaseHeaders = false)
-        return json.decodeFromString<KeyResponseDto>(body).key ?: throw Exception("Failed to get sub key")
+        val key = json.decodeFromString<KeyResponseDto>(body).key ?: throw Exception("Failed to get sub key")
+        subKeyCache[id] = key
+        return key
+    }
+
+    private fun fetchEpisodeVideo(id: String): EpisodeVideoDto {
+        val kkey = requestVideoKey(id)
+        val url = "$baseUrl/api/DramaList/Episode/$id.png?err=false&ts=&time=&kkey=$kkey"
+        val body = httpGet(url)
+        return json.decodeFromString<EpisodeVideoDto>(body)
+    }
+
+    private fun isCountdownWidget(videoUrl: String?, type: Int?): Boolean {
+        if (type == TYPE_COUNTDOWN) return true
+        if (videoUrl.isNullOrBlank()) return false
+        return videoUrl.contains("tickcounter.com", ignoreCase = true) ||
+            videoUrl.contains("/widget/countdown/", ignoreCase = true)
+    }
+
+    private fun getCountdownDetails(url: String?): String? = try {
+        val widgetUrl = fixUrl(url ?: return null) ?: return null
+        val html = httpGet(widgetUrl, sendBaseHeaders = false)
+        val match = COUNTDOWN_REGEX.find(html) ?: return null
+        val (dateStr, tzStr) = match.destructured
+        val target = synchronized(countdownDateFormat) {
+            countdownDateFormat.timeZone = TimeZone.getTimeZone(tzStr)
+            try {
+                countdownDateFormat.parse(dateStr)?.time ?: 0L
+            } catch (_: Exception) {
+                0L
+            }
+        }
+        if (target <= 0L) null
+        else {
+            val diff = target - System.currentTimeMillis()
+            if (diff <= 0) {
+                "airs soon"
+            } else {
+                val days = TimeUnit.MILLISECONDS.toDays(diff)
+                val hours = TimeUnit.MILLISECONDS.toHours(diff) % 24
+                val minutes = TimeUnit.MILLISECONDS.toMinutes(diff) % 60
+                buildString {
+                    append("airs in ")
+                    if (days > 0) append("${days}d ")
+                    if (hours > 0 || days > 0) append("${hours}h ")
+                    append("${minutes}m")
+                }.trim()
+            }
+        }
+    } catch (_: Exception) {
+        null
     }
 
     // --- Home Feed ---
@@ -124,9 +197,9 @@ class KissKHExtension :
             val pagedData = PagedData.Continuous<Shelf> { continuation ->
                 val page = continuation?.toIntOrNull() ?: 1
                 val order = if (tab?.id == "latest") "2" else "1"
-                val url = "$baseUrl/api/DramaList/List?page=$page&type=0&sub=0&country=0&status=0&order=$order&pageSize=40"
+                val url = "$baseUrl/api/DramaList/List?page=$page&type=0&sub=0&country=0&status=0&order=$order&pageSize=$PAGE_SIZE"
                 val body = httpGet(url)
-                val response = json.decodeFromString<DramaListResponseDto>(body)
+                val response = json.decodeFromString<DramaPageDto>(body)
                 val items = response.data?.mapNotNull { item ->
                     val id = item.id?.toString() ?: return@mapNotNull null
                     val title = item.title ?: return@mapNotNull null
@@ -140,7 +213,7 @@ class KissKHExtension :
                 } ?: emptyList()
 
                 val totalCount = response.totalCount ?: 0
-                val totalPages = (totalCount + 39) / 40
+                val totalPages = (totalCount + PAGE_SIZE - 1) / PAGE_SIZE
                 val nextPage = if (page < totalPages) (page + 1).toString() else null
 
                 Page(items, nextPage)
@@ -152,7 +225,7 @@ class KissKHExtension :
     // --- Search Feed ---
 
     override suspend fun loadSearchFeed(query: String): Feed<Shelf> {
-        val pagedData = PagedData.Continuous<Shelf> { continuation ->
+        val pagedData = PagedData.Continuous<Shelf> {
             val encoded = URLEncoder.encode(query, "UTF-8")
             val url = "$baseUrl/api/DramaList/Search?q=$encoded&type=0"
             val body = httpGet(url)
@@ -230,34 +303,68 @@ class KissKHExtension :
             val drama = json.decodeFromString<DramaDetailDto>(body)
             val type = drama.type
             val episodesCount = drama.episodesCount ?: 1
+            val status = drama.status.orEmpty().lowercase(Locale.ROOT)
+            val isAiringOrUpcoming = "ongoing" in status || "upcoming" in status
 
-            val tracks = drama.episodes
-                ?.sortedBy { it.number ?: 0.0 }
-                ?.mapNotNull { ep ->
-                val episodeId = ep.id?.toString() ?: return@mapNotNull null
-                val number = ep.number?.toString()?.replace(".0", "") ?: "1"
-                val name = when {
-                    type.isNullOrBlank() -> "Video $number"
-                    (type.contains("Hollywood", ignoreCase = true) && episodesCount == 1) || type.contains("Movie", ignoreCase = true) -> "Movie"
-                    else -> "Episode $number"
-                }
+            val rawEpisodes = drama.episodes.orEmpty()
+            val episodes = if (hideUnaired && isAiringOrUpcoming) {
+                filterUnairedEpisodes(rawEpisodes)
+            } else {
+                rawEpisodes
+            }
 
-                Track(
-                    id = "${dramaId}_$episodeId",
-                    title = name,
-                    type = Track.Type.Video,
-                    album = album,
-                    cover = drama.thumbnail?.toProxiedImageHolder() ?: album.cover,
-                    artists = emptyList(),
-                    extras = mapOf(
-                        "dramaId" to dramaId,
-                        "episodeId" to episodeId,
+            val tracks = episodes
+                .sortedBy { it.number ?: 0.0 }
+                .mapNotNull { ep ->
+                    val episodeId = ep.id?.toString() ?: return@mapNotNull null
+                    val number = ep.number?.toString()?.replace(".0", "") ?: "1"
+                    val name = when {
+                        type.isNullOrBlank() -> "Video $number"
+                        (type.contains("Hollywood", ignoreCase = true) && episodesCount == 1) || type.contains("Movie", ignoreCase = true) -> "Movie"
+                        else -> "Episode $number"
+                    }
+
+                    Track(
+                        id = "${dramaId}_$episodeId",
+                        title = name,
+                        type = Track.Type.Video,
+                        album = album,
+                        cover = drama.thumbnail?.toProxiedImageHolder() ?: album.cover,
+                        artists = emptyList(),
+                        extras = mapOf(
+                            "dramaId" to dramaId,
+                            "episodeId" to episodeId,
+                        )
                     )
-                )
-            } ?: emptyList()
+                }
 
             tracks.toFeed()
         }
+    }
+
+    private fun filterUnairedEpisodes(episodes: List<EpisodeDto>): List<EpisodeDto> {
+        var firstAiredIndex = 0
+        for ((index, ep) in episodes.withIndex()) {
+            val epId = ep.id?.toString() ?: break
+            val isUnaired = try {
+                isEpisodeUnaired(epId)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                break
+            }
+            if (isUnaired) {
+                firstAiredIndex = index + 1
+            } else {
+                break
+            }
+        }
+        return episodes.drop(firstAiredIndex)
+    }
+
+    private fun isEpisodeUnaired(epId: String): Boolean {
+        val videoDto = fetchEpisodeVideo(epId)
+        return isCountdownWidget(videoDto.video, videoDto.type)
     }
 
     override suspend fun loadFeed(album: Album): Feed<Shelf>? {
@@ -298,7 +405,7 @@ class KissKHExtension :
             // 2. Popular & Recommended Dramas
             try {
                 val popularJson = httpGet("$baseUrl/api/DramaList/List?page=1&type=0&sub=0&country=0&status=0&order=1&pageSize=20")
-                val popularResponse = json.decodeFromString<DramaListResponseDto>(popularJson)
+                val popularResponse = json.decodeFromString<DramaPageDto>(popularJson)
                 val popularAlbums = popularResponse.data
                     ?.filter { it.id?.toString() != currentId }
                     ?.mapNotNull { it.toAlbum() }
@@ -387,11 +494,14 @@ class KissKHExtension :
 
             val streamables = mutableListOf<Streamable>()
 
+            // Preferred quality integer
+            val qualityInt = preferredQuality.toIntOrNull() ?: 1080
+
             // Default Video Server
             streamables.add(
                 Streamable.server(
                     id = "server_$episodeId",
-                    quality = 1080,
+                    quality = qualityInt,
                     title = "KissKH Server",
                     extras = mapOf("episodeId" to episodeId)
                 )
@@ -435,16 +545,26 @@ class KissKHExtension :
                     val episodeId = streamable.extras["episodeId"]
                         ?: streamable.id.removePrefix("server_")
 
-                    val kkey = requestVideoKey(episodeId)
-                    val url = "$baseUrl/api/DramaList/Episode/$episodeId.png?err=false&ts=&time=&kkey=$kkey"
-                    val body = httpGet(url)
-                    val videoDto = json.decodeFromString<VideoResponseDto>(body)
-                    val rawVideoUrl = videoDto.Video
+                    val videoDto = fetchEpisodeVideo(episodeId)
+
+                    if (isCountdownWidget(videoDto.video, videoDto.type)) {
+                        val countdown = getCountdownDetails(videoDto.video)
+                        val message = if (countdown != null) {
+                            "This episode has not aired yet ($countdown)"
+                        } else {
+                            "This episode has not aired yet (countdown timer active)"
+                        }
+                        throw Exception(message)
+                    }
+
+                    val rawVideoUrl = videoDto.video
                         ?: throw Exception("No stream available for episode $episodeId")
                     val videoUrl = fixUrl(rawVideoUrl)
                         ?: throw Exception("Invalid stream URL for episode $episodeId")
 
                     val isHls = videoUrl.contains(".m3u8", ignoreCase = true)
+                    val qualityInt = preferredQuality.toIntOrNull() ?: 1080
+
                     val source = Streamable.Source.Http(
                         request = videoUrl.toGetRequest(
                             mapOf(
@@ -455,7 +575,7 @@ class KissKHExtension :
                         ),
                         type = if (isHls) Streamable.SourceType.HLS else Streamable.SourceType.Progressive,
                         isVideo = true,
-                        quality = 1080,
+                        quality = qualityInt,
                         title = "KissKH"
                     )
 
@@ -624,14 +744,31 @@ class KissKHExtension :
                 key = PREF_DOMAIN_KEY,
                 title = "Preferred Domain",
                 summary = "Choose the domain to access KissKH",
-                entryTitles = DOMAIN_ENTRIES.toMutableList(),
-                entryValues = DOMAIN_VALUES.toMutableList(),
+                entryTitles = DOMAIN_ENTRIES,
+                entryValues = DOMAIN_VALUES,
                 defaultEntryIndex = 0
+            ),
+            SettingList(
+                key = PREF_QUALITY_KEY,
+                title = "Preferred Quality",
+                summary = "Preferred video streaming quality",
+                entryTitles = PREF_QUALITY_ENTRIES,
+                entryValues = PREF_QUALITY_VALUES,
+                defaultEntryIndex = 0
+            ),
+            SettingSwitch(
+                key = PREF_HIDE_UNAIRED_KEY,
+                title = "Hide Unaired Episodes",
+                summary = "Hide upcoming episodes that only have a countdown timer",
+                defaultValue = PREF_HIDE_UNAIRED_DEFAULT
             )
         )
     }
 
     companion object {
+        private const val PAGE_SIZE = 40
+        private const val TYPE_COUNTDOWN = 2
+
         private const val USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -644,6 +781,7 @@ class KissKHExtension :
         private const val PREF_DOMAIN_KEY = "preferred_domain"
         private val DOMAIN_ENTRIES = listOf(
             "kisskh.do",
+            "kisskh.is",
             "kisskh.ovh",
             "kisskh.co",
             "kisskh.id",
@@ -651,6 +789,18 @@ class KissKHExtension :
         )
         private val DOMAIN_VALUES = DOMAIN_ENTRIES.map { "https://$it" }
         private val PREF_DOMAIN_DEFAULT = DOMAIN_VALUES[0]
+
+        private const val PREF_HIDE_UNAIRED_KEY = "pref_hide_unaired_episodes"
+        private const val PREF_HIDE_UNAIRED_DEFAULT = true
+
+        private const val PREF_QUALITY_KEY = "preferred_quality"
+        private val PREF_QUALITY_ENTRIES = listOf("1080p", "720p", "480p", "360p")
+        private val PREF_QUALITY_VALUES = listOf("1080", "720", "480", "360")
+        private const val PREF_QUALITY_DEFAULT = "1080"
+
+        private val COUNTDOWN_REGEX by lazy {
+            Regex("""window\.countdown\("([^"]+)",\s*"[^"]*",\s*\d+,\s*"[^"]*",\s*"([^"]+)"""")
+        }
 
         private val TIMESTAMP_REGEX =
             Regex("""(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{2,3})\s*-->\s*(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{2,3})""")
