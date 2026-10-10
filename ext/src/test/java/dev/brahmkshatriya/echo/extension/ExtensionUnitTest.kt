@@ -59,9 +59,11 @@ class ExtensionUnitTest {
         if (extension !is HomeFeedClient) error("HomeFeedClient is not implemented")
         val feed = extension.loadHomeFeed()
         println("Tabs : ${feed.tabs}")
-        feed.pagedDataOfFirst().loadPage(null).data.forEach {
-            println(it)
-        }
+        val pagedData = feed.pagedDataOfFirst()
+        val page1 = pagedData.loadPage(null)
+        println("Page 1 items count: ${page1.data.size}, nextPage: ${page1.continuation}")
+        val page2 = pagedData.loadPage(page1.continuation)
+        println("Page 2 items count: ${page2.data.size}, nextPage: ${page2.continuation}")
     }
 
     private suspend fun searchTrack(q: String? = null): Track {
